@@ -1,0 +1,246 @@
+// SPDX-License-Identifier: BSD-2-Clause
+/*
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ */
+
+#include <pas_fuse.h>
+#include <pta_qcom_fuse.h>
+#include <string.h>
+#include <tee_internal_api.h>
+
+/*
+ * One session to the fuse PTA, held for the TA's lifetime (opened in
+ * pas_fuse_open(), closed in pas_fuse_close()) and reused by every call
+ * below - matching how qcom_pas.c holds its own PTA_QCOM_PAS_UUID session
+ * rather than opening one per command.
+ */
+static TEE_TASessionHandle fuse_session;
+
+TEE_Result pas_fuse_open(void)
+{
+	static const TEE_UUID fuse_uuid = PTA_QCOM_FUSE_UUID;
+	TEE_Result res = TEE_ERROR_GENERIC;
+
+	res = TEE_OpenTASession(&fuse_uuid, TEE_TIMEOUT_INFINITE, 0, NULL,
+				&fuse_session, NULL);
+	if (res)
+		EMSG("PAS fuse: cannot open fuse PTA: %#"PRIx32, res);
+
+	return res;
+}
+
+void pas_fuse_close(void)
+{
+	TEE_CloseTASession(fuse_session);
+}
+
+/*
+ * Invoke @cmd on the shared session. Callers apply their own policy to the
+ * result and log command-specific failures.
+ */
+static TEE_Result fuse_pta_invoke(uint32_t cmd, uint32_t param_types,
+				  TEE_Param params[TEE_NUM_PARAMS])
+{
+	return TEE_InvokeTACommand(fuse_session, TEE_TIMEOUT_INFINITE, cmd,
+				   param_types, params, NULL);
+}
+
+TEE_Result pas_fuse_get_secboot_and_root_anchor(uint8_t *anchor,
+						bool *secboot_on)
+{
+	TEE_Param params[TEE_NUM_PARAMS] = { };
+	TEE_Result res = TEE_ERROR_GENERIC;
+	uint32_t pt = 0;
+
+	*secboot_on = false;
+
+	pt = TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_OUTPUT, TEE_PARAM_TYPE_NONE,
+			     TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+	res = fuse_pta_invoke(PTA_QCOM_FUSE_GET_SECBOOT_STATE, pt, params);
+	if (res) {
+		EMSG("PAS fuse: cannot read secboot state: %#"PRIx32, res);
+		return res;
+	}
+	*secboot_on = params[0].value.a != 0;
+
+	memset(params, 0, sizeof(params));
+	pt = TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_OUTPUT, TEE_PARAM_TYPE_NONE,
+			     TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+	params[0].memref.buffer = anchor;
+	params[0].memref.size = PTA_QCOM_FUSE_ROOT_OF_TRUST_SIZE;
+	res = fuse_pta_invoke(PTA_QCOM_FUSE_GET_ROOT_OF_TRUST, pt, params);
+	if (res)
+		EMSG("PAS fuse: cannot read root of trust: %#"PRIx32, res);
+
+	return res;
+}
+
+TEE_Result pas_fuse_get_hw_binding_info(bool need_soc_vers,
+					struct pas_fuse_hw_binding_info *info)
+{
+	TEE_Param params[TEE_NUM_PARAMS] = { };
+	TEE_Result res = TEE_ERROR_GENERIC;
+	uint32_t pt = 0;
+
+	pt = TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_OUTPUT,
+			     TEE_PARAM_TYPE_VALUE_OUTPUT, TEE_PARAM_TYPE_NONE,
+			     TEE_PARAM_TYPE_NONE);
+	res = fuse_pta_invoke(PTA_QCOM_FUSE_GET_DEVICE_IDS, pt, params);
+	if (res) {
+		EMSG("PAS fuse: cannot read device ids: %#"PRIx32, res);
+		return res;
+	}
+	info->oem_id = params[0].value.a;
+	info->model_id = params[0].value.b;
+	info->jtag_id = params[1].value.a;
+	info->serial_num = params[1].value.b;
+
+	memset(params, 0, sizeof(params));
+	pt = TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_OUTPUT, TEE_PARAM_TYPE_NONE,
+			     TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+	res = fuse_pta_invoke(PTA_QCOM_FUSE_GET_USE_SERIAL_NUM, pt, params);
+	if (res) {
+		EMSG("PAS fuse: cannot read USE_SERIAL_NUM fuse: %#"PRIx32,
+		     res);
+		return res;
+	}
+	info->use_serial_num_override = params[0].value.a;
+
+	if (!need_soc_vers)
+		return TEE_SUCCESS;
+
+	memset(params, 0, sizeof(params));
+	pt = TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_OUTPUT, TEE_PARAM_TYPE_NONE,
+			     TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+	res = fuse_pta_invoke(PTA_QCOM_FUSE_GET_SOC_HW_VERSION, pt, params);
+	if (res) {
+		EMSG("PAS fuse: cannot read SOC_HW_VERSION: %#"PRIx32, res);
+		return res;
+	}
+	info->soc_fam_dev = params[0].value.a;
+
+	return TEE_SUCCESS;
+}
+
+bool pas_fuse_get_eku_enforcement_en(void)
+{
+	TEE_Param params[TEE_NUM_PARAMS] = { };
+	TEE_Result res = TEE_ERROR_GENERIC;
+	uint32_t pt = 0;
+
+	pt = TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_OUTPUT, TEE_PARAM_TYPE_NONE,
+			     TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+	res = fuse_pta_invoke(PTA_QCOM_FUSE_GET_EKU_ENFORCEMENT_EN, pt, params);
+	if (res) {
+		EMSG("PAS fuse: cannot read EKU enforcement fuse: %#"PRIx32,
+		     res);
+		return false;
+	}
+
+	return params[0].value.a;
+}
+
+bool pas_fuse_get_image_encryption_en(void)
+{
+	TEE_Param params[TEE_NUM_PARAMS] = { };
+	TEE_Result res = TEE_ERROR_GENERIC;
+	uint32_t pt = 0;
+
+	pt = TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_OUTPUT, TEE_PARAM_TYPE_NONE,
+			     TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+	res = fuse_pta_invoke(PTA_QCOM_FUSE_GET_IMAGE_ENCRYPTION_EN, pt,
+			      params);
+	if (res) {
+		EMSG("PAS fuse: cannot read image encryption fuse: %#"PRIx32,
+		     res);
+		return true;
+	}
+
+	return params[0].value.a;
+}
+
+void pas_fuse_get_mrc_info(struct pas_fuse_mrc_info *info)
+{
+	TEE_Param params[TEE_NUM_PARAMS] = { };
+	TEE_Result res = TEE_ERROR_GENERIC;
+	uint32_t pt = 0;
+
+	info->num_roots = 1;
+	info->activation_list = 0;
+	info->revocation_list = 0;
+
+	pt = TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_OUTPUT,
+			     TEE_PARAM_TYPE_VALUE_OUTPUT, TEE_PARAM_TYPE_NONE,
+			     TEE_PARAM_TYPE_NONE);
+	res = fuse_pta_invoke(PTA_QCOM_FUSE_GET_MRC_INFO, pt, params);
+	if (res) {
+		EMSG("PAS fuse: cannot read MRC info: %#"PRIx32, res);
+		return;
+	}
+
+	if (!params[0].value.a)
+		return;
+
+	info->num_roots = params[0].value.b;
+	info->activation_list = params[1].value.a;
+	info->revocation_list = params[1].value.b;
+}
+
+TEE_Result pas_fuse_get_segment_hash_size(uint32_t root_cert_sel,
+					  uint32_t *hash_size)
+{
+	TEE_Param params[TEE_NUM_PARAMS] = { };
+	TEE_Result res = TEE_ERROR_GENERIC;
+	uint32_t pt = 0;
+
+	params[0].value.a = root_cert_sel;
+	pt = TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_INOUT, TEE_PARAM_TYPE_NONE,
+			     TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+	res = fuse_pta_invoke(PTA_QCOM_FUSE_GET_SEGMENT_HASH_SIZE, pt, params);
+	if (res) {
+		EMSG("PAS fuse: cannot read segment hash size: %#"PRIx32, res);
+		return res;
+	}
+
+	*hash_size = params[0].value.b;
+
+	return TEE_SUCCESS;
+}
+
+TEE_Result pas_fuse_get_pil_rollback_version(uint32_t *dev_ver)
+{
+	TEE_Param params[TEE_NUM_PARAMS] = { };
+	TEE_Result res = TEE_ERROR_GENERIC;
+	uint32_t pt = 0;
+
+	pt = TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_OUTPUT, TEE_PARAM_TYPE_NONE,
+			     TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+	res = fuse_pta_invoke(PTA_QCOM_FUSE_GET_PIL_ROLLBACK_VERSION, pt,
+			      params);
+	if (res) {
+		EMSG("PAS fuse: cannot read PIL rollback version: %#"PRIx32,
+		     res);
+		return res;
+	}
+
+	*dev_ver = params[0].value.a;
+
+	return TEE_SUCCESS;
+}
+
+TEE_Result pas_fuse_blow_pil_rollback_version(uint32_t version)
+{
+	TEE_Param params[TEE_NUM_PARAMS] = { };
+	TEE_Result res = TEE_ERROR_GENERIC;
+	uint32_t pt = 0;
+
+	params[0].value.a = version;
+	pt = TEE_PARAM_TYPES(TEE_PARAM_TYPE_VALUE_INPUT, TEE_PARAM_TYPE_NONE,
+			     TEE_PARAM_TYPE_NONE, TEE_PARAM_TYPE_NONE);
+	res = fuse_pta_invoke(PTA_QCOM_FUSE_BLOW_PIL_ROLLBACK_VERSION, pt,
+			      params);
+	if (res)
+		IMSG("PAS ARB: fuse advance failed: %#"PRIx32, res);
+
+	return res;
+}
