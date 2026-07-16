@@ -7,12 +7,6 @@ ifneq ($(CFG_INSECURE),y)
 CFG_QCOM_QFPROM_FUSEPROV ?= y
 endif
 
-ifeq ($(CFG_QCOM_QFPROM_FUSEPROV),y)
-$(call force,CFG_QCOM_CMD_DB,y)
-$(call force,CFG_QCOM_RPMH_CLIENT,y)
-$(call force,CFG_QCOM_QFPROM,y)
-endif
-
 CFG_QCOM_PAS_PTA ?= y
 
 ifeq ($(CFG_QCOM_PAS_PTA),y)
@@ -29,3 +23,23 @@ CFG_IN_TREE_EARLY_TAS += qcom_pas/cff7d191-7ca0-4784-af13-48223b9a4fbe
 CFG_QCOM_PAS_AUTH ?= y
 endif
 CFG_QCOM_HWKM ?= y
+
+# Signature authentication reads the OEM root-of-trust anchor, anti-rollback
+# version, device identity and other fuses via the fuse PTA; enable it (and
+# therefore the underlying qfprom driver) whenever PAS authentication is on.
+ifeq ($(CFG_QCOM_PAS_AUTH),y)
+$(call force,CFG_QCOM_FUSE_PTA,y)
+endif
+
+# QFPROM backs fuse provisioning (writes) and the fuse PTA (reads) alike;
+# enable the driver whenever either consumer is on.
+ifneq ($(filter y,$(CFG_QCOM_QFPROM_FUSEPROV) $(CFG_QCOM_FUSE_PTA)),)
+$(call force,CFG_QCOM_QFPROM,y)
+endif
+
+# CMD_DB/RPMH_CLIENT back the qfprom driver's fuse-write path (voltage rail
+# sequencing), needed whenever qfprom itself is enabled.
+ifeq ($(CFG_QCOM_QFPROM),y)
+$(call force,CFG_QCOM_CMD_DB,y)
+$(call force,CFG_QCOM_RPMH_CLIENT,y)
+endif
