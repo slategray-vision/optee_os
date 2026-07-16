@@ -26,7 +26,10 @@
  */
 
 #include <pas_auth.h>
+#include <pas_fuse.h>
 #include <pas_mbn_parser.h>
+#include <pas_sig_auth.h>
+#include <pta_qcom_fuse.h>
 #include <pta_qcom_pas.h>
 #include <qcom_pas_priv.h>
 #include <string.h>
@@ -47,28 +50,22 @@ static struct pas_md_slot *find_md_slot(struct qcom_pas_session *s,
 }
 
 /*
- * Placeholder for signature authentication. Runs only on devices with
- * secure-boot fuses blown; on unprovisioned devices the caller skips
- * calling this function. Replaced by the real signature-authentication
- * implementation in a later commit; keeping the seam here now lets
- * segment-hash verification be reviewed and enabled without waiting on
- * the signature-auth work.
- */
-static TEE_Result pas_authenticate_signature(struct pas_md_slot *slot __unused,
-					     uint32_t pas_id __unused)
-{
-	return TEE_SUCCESS;
-}
-
-/*
- * Return true when the device is provisioned for secure boot (OEM
- * root-of-trust anchor fused). Until the fuse-reading path is wired in
- * (later commit), report "not provisioned" so devices without secure
- * boot continue to work with hash verification alone.
+ * A device is provisioned for secure boot when the OEM root-of-trust
+ * anchor fuse is blown. Read it via the fuse PTA; on a fuse-PTA access
+ * failure treat the device as unprovisioned (segment-hash verification
+ * still runs), rather than failing every INIT_IMAGE.
  */
 static bool secure_boot_provisioned(void)
 {
-	return false;
+	uint8_t anchor[PTA_QCOM_FUSE_ROOT_OF_TRUST_SIZE] = { };
+	bool secboot_on = false;
+	TEE_Result res = TEE_ERROR_GENERIC;
+
+	res = pas_fuse_get_secboot_and_root_anchor(anchor, &secboot_on);
+	if (res)
+		return false;
+
+	return secboot_on;
 }
 
 TEE_Result pas_auth_save_metadata(struct qcom_pas_session *s, uint32_t pt,
@@ -127,6 +124,7 @@ TEE_Result pas_auth_authenticate(struct qcom_pas_session *s, uint32_t pas_id)
 {
 	struct pas_md_slot *slot = find_md_slot(s, pas_id);
 	TEE_Result res = TEE_ERROR_GENERIC;
+	uint32_t hash_size = TEE_SHA384_HASH_SIZE;
 
 	if (!slot) {
 		EMSG("PAS auth: no metadata for pas_id=%"PRIu32
@@ -134,15 +132,29 @@ TEE_Result pas_auth_authenticate(struct qcom_pas_session *s, uint32_t pas_id)
 		return TEE_ERROR_BAD_STATE;
 	}
 
-	res = pas_mbn_parse(slot->md, slot->md_size, TEE_SHA384_HASH_SIZE,
-			    &slot->mbn);
+	/*
+	 * On secure-boot devices the segment-hash algorithm is selected by
+	 * the OEM metadata's root_cert_sel field, read via the fuse PTA.
+	 * On unprovisioned devices default to SHA-384.
+	 */
+	if (secure_boot_provisioned()) {
+		res = pas_sig_auth_hash_size(slot, &hash_size);
+		if (res) {
+			EMSG("PAS auth: cannot pick hash size: %#"PRIx32, res);
+			return res;
+		}
+	}
+
+	res = pas_mbn_parse(slot->md, slot->md_size, hash_size, &slot->mbn);
 	if (res) {
 		EMSG("PAS auth: MBN parse failed: %#"PRIx32, res);
 		return res;
 	}
 
 	if (secure_boot_provisioned()) {
-		res = pas_authenticate_signature(slot, pas_id);
+		res = pas_sig_auth_authenticate(&slot->mbn, slot->md,
+						slot->md_size, pas_id,
+						hash_size);
 		if (res)
 			return res;
 	}

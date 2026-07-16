@@ -4,3 +4,6 @@ srcs-$(CFG_QCOM_PAS_AUTH) += pas_auth.c
 srcs-$(CFG_QCOM_PAS_AUTH) += pas_fuse.c
 srcs-$(CFG_QCOM_PAS_AUTH) += pas_mbn_parser.c
 srcs-$(CFG_QCOM_PAS_AUTH) += pas_meta.c
+srcs-$(CFG_QCOM_PAS_AUTH) += pas_policy.c
+srcs-$(CFG_QCOM_PAS_AUTH) += pas_sig.c
+srcs-$(CFG_QCOM_PAS_AUTH) += pas_sig_auth.c
