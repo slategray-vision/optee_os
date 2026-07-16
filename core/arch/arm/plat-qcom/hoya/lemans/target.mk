@@ -21,5 +21,11 @@ ifeq ($(CFG_QCOM_PAS_PTA),y)
 # fits only one, so reserve 256 MB with headroom.
 CFG_RESERVED_VASPACE_SIZE ?= (256 * 1024 * 1024)
 CFG_IN_TREE_EARLY_TAS += qcom_pas/cff7d191-7ca0-4784-af13-48223b9a4fbe
+
+# Authenticate each PIL firmware image on INIT_IMAGE: verify the per-segment
+# hash table against the loaded firmware, and (on devices with secure-boot
+# fuses blown) validate the image's certificate chain, signature and
+# fuse-bound bindings before releasing the peripheral from reset.
+CFG_QCOM_PAS_AUTH ?= y
 endif
 CFG_QCOM_HWKM ?= y
