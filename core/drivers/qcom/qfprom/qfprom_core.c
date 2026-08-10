@@ -513,18 +513,15 @@ uint32_t qfprom_fec_63_56_bit(uint32_t lsb_data, uint32_t msb_data)
 
 TEE_Result qcom_secboot_is_enabled(bool *enabled)
 {
-	struct qfprom_context *drv = qfprom_get_context();
-	uint32_t val = 0;
-
 	if (!enabled)
 		return TEE_ERROR_BAD_PARAMETERS;
 
-	if (!drv->raw_base_va)
+	vaddr_t va = (vaddr_t)phys_to_virt(SECURE_BOOT_APPS_ADDR, MEM_AREA_IO_SEC,
+				   sizeof(uint32_t));
+	if (!va)
 		return TEE_ERROR_BAD_STATE;
 
-	val = io_read32(drv->raw_base_va +
-			(SECURE_BOOT_APPS_ADDR - SECURITY_CONTROL_BASE));
-	*enabled = (val & SECURE_BOOT_AUTH_EN_BMSK) != 0;
+	*enabled = (io_read32(va) & SECURE_BOOT_AUTH_EN_BMSK) != 0;
 
 	return TEE_SUCCESS;
 }
@@ -537,18 +534,15 @@ TEE_Result qcom_secboot_is_enabled(bool *enabled)
  */
 TEE_Result qcom_secboot_get_use_serial_num(bool *enabled)
 {
-	struct qfprom_context *drv = qfprom_get_context();
-	uint32_t val = 0;
-
 	if (!enabled)
 		return TEE_ERROR_BAD_PARAMETERS;
 
-	if (!drv->raw_base_va)
+	vaddr_t va = (vaddr_t)phys_to_virt(SECURE_BOOT_APPS_ADDR, MEM_AREA_IO_SEC,
+				   sizeof(uint32_t));
+	if (!va)
 		return TEE_ERROR_BAD_STATE;
 
-	val = io_read32(drv->raw_base_va +
-			(SECURE_BOOT_APPS_ADDR - SECURITY_CONTROL_BASE));
-	*enabled = (val & SECURE_BOOT_USE_SERIAL_NUM_BMSK) != 0;
+	*enabled = (io_read32(va) & SECURE_BOOT_USE_SERIAL_NUM_BMSK) != 0;
 
 	return TEE_SUCCESS;
 }
@@ -561,13 +555,12 @@ TEE_Result qcom_secboot_get_use_serial_num(bool *enabled)
  */
 static TEE_Result read_corr_word(paddr_t pa, uint32_t mask, uint32_t *out)
 {
-	struct qfprom_context *drv = qfprom_get_context();
-	vaddr_t va = 0;
+	vaddr_t va = (vaddr_t)phys_to_virt(pa, MEM_AREA_IO_SEC,
+					   sizeof(uint32_t));
 
-	if (!drv->corr_base_va)
+	if (!va)
 		return TEE_ERROR_BAD_STATE;
 
-	va = drv->corr_base_va + (pa - QFPROM_CORR_BASE);
 	*out = io_read32(va) & mask;
 	return TEE_SUCCESS;
 }
@@ -741,12 +734,13 @@ TEE_Result qcom_secboot_blow_pil_rollback_version(uint32_t version)
 /* Read a device-identity sense register from the mapped SECURITY_CONTROL. */
 static TEE_Result read_sense_reg(paddr_t pa, uint32_t *out)
 {
-	struct qfprom_context *drv = qfprom_get_context();
+	vaddr_t va = (vaddr_t)phys_to_virt(pa, MEM_AREA_IO_SEC,
+					   sizeof(uint32_t));
 
-	if (!drv->raw_base_va)
+	if (!va)
 		return TEE_ERROR_BAD_STATE;
 
-	*out = io_read32(drv->raw_base_va + (pa - SECURITY_CONTROL_BASE));
+	*out = io_read32(va);
 
 	return TEE_SUCCESS;
 }
@@ -798,7 +792,7 @@ TEE_Result qcom_secboot_get_segment_hash_size(uint32_t root_cert_sel,
 			return res;
 
 		if (val & BIT32(SEGMENT_HASH_FUNCTION_SELECT0_SHFT +
-				root_cert_sel))
+					  root_cert_sel))
 			*hash_size = TEE_SHA256_HASH_SIZE;
 		else
 			*hash_size = TEE_SHA384_HASH_SIZE;
@@ -914,13 +908,11 @@ TEE_Result qcom_secboot_get_mrc_info(bool *root_sel_enabled,
 
 TEE_Result qcom_secboot_get_soc_hw_version(uint32_t *fam_dev)
 {
-	vaddr_t va = 0;
-
 	if (!fam_dev)
 		return TEE_ERROR_BAD_PARAMETERS;
 
 	/* SOC_HW_VERSION is a TCSR register, not part of the fuse map. */
-	va = (vaddr_t)phys_to_virt(TCSR_SOC_HW_VERSION_ADDR, MEM_AREA_IO_SEC,
+	vaddr_t va = (vaddr_t)phys_to_virt(TCSR_SOC_HW_VERSION_ADDR, MEM_AREA_IO_SEC,
 				   sizeof(uint32_t));
 	if (!va) {
 		va = (vaddr_t)core_mmu_add_mapping(MEM_AREA_IO_SEC,

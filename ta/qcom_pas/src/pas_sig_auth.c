@@ -39,11 +39,16 @@ static const uint8_t qti_root_of_trust[TEE_SHA384_HASH_SIZE] = {
 };
 
 /*
- * Accepted metadata major versions: V0 (0) and V1 (1); minor must be 0.
+ * Accepted metadata major versions: V0 (0) and V1 (1) for MBN v6, minor must
+ * be 0. MBN v7 uses a disjoint major-version scheme (2.0/3.0, selecting the
+ * soc_feature_id/product_segment_id union member) checked separately below.
  */
 #define SECBOOT_METADATA_MAJOR_V0	0U
 #define SECBOOT_METADATA_MAJOR_V1	1U
 #define SECBOOT_METADATA_MINOR		0U
+
+#define SECBOOT_METADATA7_MAJOR_V2	2U
+#define SECBOOT_METADATA7_MAJOR_V3	3U
 
 /*
  * Reject metadata whose major/minor version falls outside the accepted
@@ -55,6 +60,7 @@ static TEE_Result check_metadata_version(const struct pas_mbn *hs,
 {
 	TEE_Result res = TEE_ERROR_GENERIC;
 	struct pas_meta meta = { };
+	bool valid = false;
 
 	res = pas_meta_get(hs, &meta);
 	if (res == TEE_ERROR_NO_DATA)
@@ -64,9 +70,15 @@ static TEE_Result check_metadata_version(const struct pas_mbn *hs,
 		return secboot_on ? res : TEE_SUCCESS;
 	}
 
-	if ((meta.major == SECBOOT_METADATA_MAJOR_V0 ||
-	     meta.major == SECBOOT_METADATA_MAJOR_V1) &&
-	    meta.minor == SECBOOT_METADATA_MINOR)
+	if (hs->version == PAS_MBN_VERSION_7)
+		valid = (meta.major == SECBOOT_METADATA7_MAJOR_V2 ||
+			meta.major == SECBOOT_METADATA7_MAJOR_V3) &&
+			meta.minor == SECBOOT_METADATA_MINOR;
+	else
+		valid = (meta.major == SECBOOT_METADATA_MAJOR_V0 ||
+			meta.major == SECBOOT_METADATA_MAJOR_V1) &&
+			meta.minor == SECBOOT_METADATA_MINOR;
+	if (valid)
 		return TEE_SUCCESS;
 
 	EMSG("PAS auth: unsupported metadata version %"PRIu32".%"PRIu32,
@@ -180,27 +192,60 @@ struct pas_device_ids {
 };
 
 /*
- * Bind OEM_ID and MODEL_ID to the device fuses: each field is checked
- * unless its *_INDEPENDENT flag exempts it.
+ * True if @meta's SoC-HW-version binding is active: v6's IN_USE_SOC_HW_VERSION
+ * flag, or v7's SOC_HW_VERSION_BOUND flag pair being "10" (bound).
+ */
+static bool pas_meta_soc_vers_bound(const struct pas_meta *meta)
+{
+	if (meta->is_v7)
+		return pas_meta7_flag_bound(meta->flags,
+			PAS_META7_FLAG_SOC_HW_VERSION_BOUND_SHIFT);
+	return meta->flags & BIT32(PAS_META_FLAG_IN_USE_SOC_HW_VERSION);
+}
+
+/*
+ * True if @meta's JTAG-ID binding is active: v6's IN_USE_JTAG_ID flag, or
+ * v7's JTAG_ID_BOUND flag pair being "10" (bound).
+ */
+static bool pas_meta_jtag_bound(const struct pas_meta *meta)
+{
+	if (meta->is_v7)
+		return pas_meta7_flag_bound(meta->flags,
+					    PAS_META7_FLAG_JTAG_ID_BOUND_SHIFT);
+	return meta->flags & BIT32(PAS_META_FLAG_IN_USE_JTAG_ID);
+}
+
+/*
+ * Bind OEM_ID and MODEL_ID to the device fuses. v6: each field is checked
+ * unless its *_INDEPENDENT flag exempts it. v7: each field is checked only
+ * when its *_BOUND flag pair is "10" (bound).
  */
 static TEE_Result check_oem_model_binding(const struct pas_meta *meta,
 					  const struct pas_device_ids *ids,
 					  bool secboot_on)
 {
-	bool oem_independent = meta->flags &
-				BIT32(PAS_META_FLAG_OEM_ID_INDEPENDENT);
+	bool oem_independent = false;
 	bool model_independent = false;
 
-	/*
-	 * v0 metadata has no MODEL_ID_INDEPENDENT bit; it is implied by
-	 * OEM_ID_INDEPENDENT. Reading bit 11 unconditionally wrongly
-	 * enforced MODEL_ID binding on v0-signed images.
-	 */
-	if (meta->major == 0)
-		model_independent = oem_independent;
-	else
-		model_independent = meta->flags &
-				    BIT32(PAS_META_FLAG_MODEL_ID_INDEPENDENT);
+	if (meta->is_v7) {
+		oem_independent = !pas_meta7_flag_bound(meta->flags,
+				PAS_META7_FLAG_OEM_ID_BOUND_SHIFT);
+		model_independent = !pas_meta7_flag_bound(meta->flags,
+				PAS_META7_FLAG_OEM_PRODUCT_ID_BOUND_SHIFT);
+	} else {
+		oem_independent = meta->flags &
+				  BIT32(PAS_META_FLAG_OEM_ID_INDEPENDENT);
+		/*
+		 * v0 metadata has no MODEL_ID_INDEPENDENT bit; it is implied
+		 * by OEM_ID_INDEPENDENT. Reading bit 11 unconditionally
+		 * wrongly enforced MODEL_ID binding on v0-signed images.
+		 */
+		if (meta->major == 0)
+			model_independent = oem_independent;
+		else
+			model_independent = meta->flags &
+				BIT32(PAS_META_FLAG_MODEL_ID_INDEPENDENT);
+	}
 
 	if (!oem_independent && meta->oem_id != ids->oem_id) {
 		EMSG("PAS auth: OEM_ID got %#"PRIx32" want %#"PRIx32,
@@ -222,14 +267,15 @@ static TEE_Result check_oem_model_binding(const struct pas_meta *meta,
 }
 
 /*
- * Bind HW_ID (JTAG authentication bits) to the device fuse; checked only
- * when IN_USE_JTAG_ID is set.
+ * Bind HW_ID (JTAG authentication bits) to the device fuse. v6: checked only
+ * when IN_USE_JTAG_ID is set. v7: checked only when the JTAG_ID_BOUND flag
+ * pair is "10" (bound).
  */
 static TEE_Result check_jtag_binding(const struct pas_meta *meta,
 				     const struct pas_device_ids *ids,
 				     bool secboot_on)
 {
-	if (!(meta->flags & BIT32(PAS_META_FLAG_IN_USE_JTAG_ID)))
+	if (!pas_meta_jtag_bound(meta))
 		return TEE_SUCCESS;
 
 	if (meta->hw_id == ids->jtag_id)
@@ -244,16 +290,25 @@ static TEE_Result check_jtag_binding(const struct pas_meta *meta,
 }
 
 /*
- * Bind the device serial number against the metadata allow-list. Checked when
- * the metadata's USE_SERIAL_NUMBER flag is set, the APPS SECURE_BOOTn
- * USE_SERIAL_NUM fuse override forces it, or the DEBUG/root-revoke-activate/
- * UIE-key-switch option requests its SN-gated enable value (the reference
- * gates each of those three on a serial match, independently of whether this
- * TA acts on the requested permission). When none of those triggers apply,
- * the check is skipped entirely, matching the reference. When a trigger does
- * apply, the reference treats a device with no fused serial as unbindable
- * and fails the check rather than skipping it - a zero fused serial is not a
- * no-op here either.
+ * Bind the device serial number against the metadata allow-list.
+ *
+ * v6: checked when the metadata's USE_SERIAL_NUMBER flag is set, the APPS
+ * SECURE_BOOTn USE_SERIAL_NUM fuse override forces it, or the
+ * DEBUG/root-revoke-activate/UIE-key-switch option requests its SN-gated
+ * enable value (the reference gates each of those three on a serial match,
+ * independently of whether this TA acts on the requested permission).
+ *
+ * v7: checked only when the SERIAL_NUMBER_BOUND flag pair is "10" (bound) or
+ * the fuse override forces it - v7's debug-lock/root-revoke-activate flag
+ * pairs are plain two-state enables (see secboot_check_debug_lock() /
+ * secboot_check_enable_revocation_activation_mbnv7() in the reference), with
+ * no third SN-gated state the way v6's 2-bit option fields have, so no
+ * SN-gating gate applies here for v7.
+ *
+ * When none of those triggers apply, the check is skipped entirely, matching
+ * the reference. When a trigger does apply, the reference treats a device
+ * with no fused serial as unbindable and fails the check rather than
+ * skipping it - a zero fused serial is not a no-op here either.
  */
 static TEE_Result check_serial_binding(const struct pas_meta *meta,
 				       const struct pas_device_ids *ids,
@@ -265,18 +320,25 @@ static TEE_Result check_serial_binding(const struct pas_meta *meta,
 		PAS_META_FLAG_ROOT_REVOKE_ACTIVATE_SHIFT,
 		PAS_META_FLAG_UIE_KEY_SWITCH_SHIFT,
 	};
+	uint32_t v7_shift = PAS_META7_FLAG_SERIAL_NUMBER_BOUND_SHIFT;
+	bool bound = false;
 	bool sn_gated = false;
 	size_t i = 0;
 
-	for (i = 0; i < ARRAY_SIZE(sn_gated_shifts); i++) {
-		if (pas_meta_option_sn_gated(meta->flags, sn_gated_shifts[i])) {
-			sn_gated = true;
-			break;
+	if (meta->is_v7) {
+		bound = pas_meta7_flag_bound(meta->flags, v7_shift);
+	} else {
+		bound = meta->flags & BIT32(PAS_META_FLAG_USE_SERIAL_NUMBER);
+		for (i = 0; i < ARRAY_SIZE(sn_gated_shifts); i++) {
+			if (pas_meta_option_sn_gated(meta->flags,
+						     sn_gated_shifts[i])) {
+				sn_gated = true;
+				break;
+			}
 		}
 	}
 
-	if (!(meta->flags & BIT32(PAS_META_FLAG_USE_SERIAL_NUMBER)) &&
-	    !use_serial_num_override && !sn_gated)
+	if (!bound && !use_serial_num_override && !sn_gated)
 		return TEE_SUCCESS;
 
 	if (!ids->serial_num) {
@@ -303,15 +365,25 @@ static TEE_Result check_serial_binding(const struct pas_meta *meta,
 
 /*
  * Bind the SoC family|device version against the metadata allow-list;
- * checked only when IN_USE_SOC_HW_VERSION is set.
+ * checked only when the SoC-HW-version binding is active (see
+ * pas_meta_soc_vers_bound()). v7 additionally rejects a zero fused family
+ * number outright when the binding is active - v6 has no such guard.
  */
 static TEE_Result check_soc_vers_binding(const struct pas_meta *meta,
 					 uint32_t fam_dev, bool secboot_on)
 {
 	size_t i = 0;
 
-	if (!(meta->flags & BIT32(PAS_META_FLAG_IN_USE_SOC_HW_VERSION)))
+	if (!pas_meta_soc_vers_bound(meta))
 		return TEE_SUCCESS;
+
+	if (meta->is_v7 && !fam_dev) {
+		EMSG("PAS auth: SOC_HW_VERSION family number is zero");
+		if (secboot_on)
+			return TEE_ERROR_SECURITY;
+		IMSG("PAS auth: zero SOC_HW_VERSION tolerated");
+		return TEE_SUCCESS;
+	}
 
 	for (i = 0; i < ARRAY_SIZE(meta->soc_vers); i++) {
 		if (meta->soc_vers[i] == fam_dev)
@@ -323,6 +395,31 @@ static TEE_Result check_soc_vers_binding(const struct pas_meta *meta,
 	if (secboot_on)
 		return TEE_ERROR_SECURITY;
 	IMSG("PAS auth: SOC_HW_VERSION mismatch tolerated");
+	return TEE_SUCCESS;
+}
+
+/*
+ * Reject a v7 image that binds to neither JTAG_ID nor SOC_HW_VERSION unless
+ * its SW_ID is present in the hardware-independent SW-ID allow list. Mirrors
+ * the reference: TZ_APP images may run unbound to either hardware
+ * identifier; every other SW_ID must bind to at least one.
+ */
+#define SECBOOT_TZ_APP_SW_TYPE	0x0CU
+
+static TEE_Result check_jtag_or_soc_vers_binding(const struct pas_meta *meta,
+						 bool secboot_on)
+{
+	if (pas_meta_jtag_bound(meta) || pas_meta_soc_vers_bound(meta))
+		return TEE_SUCCESS;
+
+	if (meta->sw_id == SECBOOT_TZ_APP_SW_TYPE)
+		return TEE_SUCCESS;
+
+	EMSG("PAS auth: SW_ID %#"PRIx32" unbound to JTAG_ID and SOC_VERS",
+	     meta->sw_id);
+	if (secboot_on)
+		return TEE_ERROR_SECURITY;
+	IMSG("PAS auth: JTAG/SOC_VERS binding failure tolerated");
 	return TEE_SUCCESS;
 }
 
@@ -349,11 +446,20 @@ static TEE_Result check_hw_binding(const struct pas_mbn *hs,
 		return secboot_on ? res : TEE_SUCCESS;
 	}
 
-	res = check_metadata_options(&meta, secboot_on);
-	if (res)
-		return res;
+	if (meta.is_v7) {
+		if (!pas_meta7_flags_valid(meta.flags)) {
+			EMSG("PAS auth: bad v7 flags %#"PRIx32, meta.flags);
+			if (secboot_on)
+				return TEE_ERROR_SECURITY;
+			IMSG("PAS auth: invalid v7 flag encoding tolerated");
+		}
+	} else {
+		res = check_metadata_options(&meta, secboot_on);
+		if (res)
+			return res;
+	}
 
-	need_soc_vers = meta.flags & BIT32(PAS_META_FLAG_IN_USE_SOC_HW_VERSION);
+	need_soc_vers = pas_meta_soc_vers_bound(&meta);
 	res = pas_fuse_get_hw_binding_info(need_soc_vers, &info);
 	if (res)
 		return secboot_on ? res : TEE_SUCCESS;
@@ -379,6 +485,12 @@ static TEE_Result check_hw_binding(const struct pas_mbn *hs,
 	res = check_soc_vers_binding(&meta, info.soc_fam_dev, secboot_on);
 	if (res)
 		return res;
+
+	if (meta.is_v7) {
+		res = check_jtag_or_soc_vers_binding(&meta, secboot_on);
+		if (res)
+			return res;
+	}
 
 	DMSG("PAS auth: HW binding ok (oem=%#"PRIx32" model=%#"PRIx32")",
 	     ids.oem_id, ids.model_id);
@@ -705,11 +817,10 @@ static TEE_Result check_anti_rollback(const struct pas_mbn *hs)
 
 /*
  * Determine the per-segment hash digest size for @slot's metadata, mirroring
- * the reference segment-hash-algorithm selection: the OEM metadata's
- * root_cert_sel (word 28) selects the fuse-configured algorithm via the fuse
- * PTA on platforms that implement the field; images without OEM metadata
- * (MBN v5) or without the fuse field use the reference default
- * root_cert_sel of 0.
+ * the reference segment-hash-algorithm selection: v5 hash tables are always
+ * SHA-256 by format definition; v6 selects the fuse-configured algorithm via
+ * the OEM metadata's root_cert_sel (word 28); v7 selects it via the signed
+ * common-metadata's hash_table_algo field, which needs no fuse lookup.
  */
 #define SECBOOT_DEFAULT_ROOT_CERT_SEL	0U
 
@@ -732,6 +843,9 @@ TEE_Result pas_sig_auth_hash_size(const struct pas_md_slot *slot,
 		*hash_size = TEE_SHA256_HASH_SIZE;
 		return TEE_SUCCESS;
 	}
+	if (version == PAS_MBN_VERSION_7)
+		return pas_meta_peek_hash_table_algo(slot->md, slot->md_size,
+						     hash_size);
 
 	res = pas_meta_peek_root_cert_sel(slot->md, slot->md_size,
 					  &root_cert_sel);
